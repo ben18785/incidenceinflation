@@ -169,6 +169,9 @@ nb_log_likelihood_Rt_piece <- function(Rt, kappa, w, onset_times, cases_df) {
   if(max(matches) != nrow(cases_df))
     stop("Onset times must be last entries in cases_df.")
 
+  if(Rt < 0)
+    return(-Inf)
+
   piece_width <- length(onset_times)
   m_w <- construct_w_matrix(w, piece_width)
   wmax <- length(w)
@@ -190,47 +193,39 @@ nb_log_likelihood_Rt_piece <- function(Rt, kappa, w, onset_times, cases_df) {
 #'
 #' @param prior_shape Rt prior shape parameter
 #' @param prior_rate Rt prior rate parameter
-#' @param posterior_shape Rt posterior shape parameter
-#' @param posterior_rate Rt posterior rate parameter
 #' @inheritParams nb_log_likelihood_Rt_piece
 #' @param ndraws number of draws of Rt to return
 #' @param nresamples number of resamples used to calculate weights for
 #'
 #' @return a vector of Rt draws
-sample_nb_Rt_piece <- function(prior_shape, prior_rate,
-          posterior_shape, posterior_rate,
-          kappa,
-          w,
-          onset_times,
-          cases_df,
-          ndraws,
-          nresamples) {
+sample_nb_Rt_piece <- function(
+    Rt_current,
+    prior_shape,
+    prior_rate,
+    kappa,
+    w,
+    onset_times,
+    cases_df,
+    R_sd) {
 
-  # sample from Poisson posterior but with larger sd
-  mu <- posterior_shape / posterior_rate
-  sd <- sqrt(posterior_shape / posterior_rate^2)
-  sd <- sd * (1 + mu / kappa) * 5 # approximate inflation adjustment
-  new_shape <- mu^2 / sd^2
-  new_rate <- new_shape / mu
-  R_proposed <- stats::rgamma(nresamples, new_shape, new_rate)
-  # log_prior and log_posterior (from Poisson)
-  log_prior <- stats::dgamma(R_proposed, prior_shape, prior_rate,
+  # current
+  log_prior_current <- stats::dgamma(Rt_current, prior_shape, prior_rate,
+                                      log=TRUE)
+  log_like <- nb_log_likelihood_Rt_piece(Rt_current, kappa, w, onset_times, cases_df)
+  logp_current <- log_like + log_prior_current
+
+  # proposed
+  Rt_proposed <- stats::rnorm(1, Rt_current, R_sd)
+  log_prior_proposed <- stats::dgamma(Rt_proposed, prior_shape, prior_rate,
                              log=TRUE)
-  log_posterior_poisson <- stats::dgamma(R_proposed, new_shape, new_rate,
-                                         log=TRUE)
+  log_like <- nb_log_likelihood_Rt_piece(Rt_proposed, kappa, w, onset_times, cases_df)
+  logp_proposed <- log_like + log_prior
 
-  # calculate weights
-  log_ws <- vector(length = nresamples)
-  for(i in 1:nresamples) {
-    log_like <- nb_log_likelihood_Rt_piece(R_proposed[i], kappa, w, onset_times, cases_df)
-    log_ws[i] <- log_like + log_prior[i] - log_posterior_poisson[i]
-  }
-  log_sum_p <- matrixStats::logSumExp(log_ws)
-  ws <- exp(log_ws - log_sum_p)
-
-  ids <- sample(1:nresamples, replace=TRUE, prob=ws,
-                size=ndraws)
-  R_proposed[ids]
+  # ignore other outputs since each time we re-calculate logp_current
+  res <- accept_reject(
+    logp_current, logp_proposed,
+    Rt_current, Rt_proposed)
+  res$parameter
 }
 
 #' Draws from the gamma distribution or returns the value which maximises
@@ -254,8 +249,8 @@ sample_or_maximise_gamma <- function(shape, rate, ndraws, maximise=FALSE) {
 #' constant element of an Rt vector
 #'
 #' @param Rt_piece_index the index of the Rt piece being sampled
-#' @param cases_history_df a tibble with three columns: time_onset, cases_true
-#' and Rt_index
+#' @param cases_history_df a tibble with four columns: time_onset, cases_true
+#' Rt_index and Rt
 #' @param Rt_prior_parameters a list with elements 'shape' and 'rate' describing
 #' the gamma prior for Rt
 #' @inheritParams sample_cases_history
@@ -272,7 +267,7 @@ sample_Rt_single_piece <- function(
     kappa=NULL,
     serial_max=40, ndraws=1,
     maximise=FALSE, is_negative_binomial=FALSE,
-    nresamples=100) {
+    R_sd=NULL) {
 
   short_df <- cases_history_df %>%
     dplyr::filter(.data$Rt_index <= Rt_piece_index)
@@ -311,14 +306,18 @@ sample_Rt_single_piece <- function(
     sample_or_maximise_gamma(
       posterior_shape, posterior_rate, ndraws, maximise)
   } else {
-    sample_nb_Rt_piece(Rt_prior_parameters$shape, Rt_prior_parameters$rate,
-              posterior_shape, posterior_rate,
-              kappa,
-              w,
-              onset_times,
-              short_df,
-              ndraws,
-              nresamples)
+
+    Rt_current <- dplyr::last(short_df$Rt)
+
+    sample_nb_Rt_piece(
+      Rt_current,
+      Rt_prior_parameters$shape,
+      Rt_prior_parameters$rate,
+      kappa,
+      w,
+      onset_times,
+      short_df,
+      R_sd)
   }
 }
 
@@ -356,7 +355,7 @@ sample_Rt <- function(cases_history_df,
                       ndraws=1,
                       maximise=FALSE,
                       is_negative_binomial=FALSE,
-                      nresamples=100) {
+                      R_sd=NULL) {
 
   if(is_negative_binomial) {
     if(is.null(kappa)) {
@@ -381,7 +380,7 @@ sample_Rt <- function(cases_history_df,
       kappa,
       serial_max, ndraws, maximise=maximise,
       is_negative_binomial=is_negative_binomial,
-      nresamples=nresamples)
+      R_sd=R_sd)
     for(j in 1:ndraws) {
       m_draws[k, ] <- c(Rt_piece_index, j, Rt_vals[j])
       k <- k + 1
@@ -782,7 +781,8 @@ mcmc_single <- function(
   serial_max=40, p_gamma_cutoff=0.99, maximise=FALSE, print_to_screen=TRUE,
   initial_overdispersion=5,
   is_negative_binomial=FALSE,
-  overdispersion_metropolis_sd=0.5) {
+  overdispersion_metropolis_sd=0.5,
+  R_sd=0.25) {
 
   cnames <- colnames(snapshot_with_Rt_index_df)
   expected_names <- c("time_onset", "time_reported",
@@ -847,6 +847,7 @@ mcmc_single <- function(
 
   k <- 1
   for(i in 1:niterations) {
+    print(i)
 
     if(print_to_screen)
       init[i] <- Sys.time()
@@ -871,7 +872,7 @@ mcmc_single <- function(
 
     # sample Rt
     cases_history_df <- df_running %>%
-      dplyr::select(time_onset, Rt_index) %>%
+      dplyr::select(time_onset, Rt_index, Rt) %>%
       dplyr::left_join(df_temp, by = "time_onset", relationship = "many-to-many") %>%
       dplyr::select(-c("cases_reported", "time_reported")) %>%
       dplyr::rename(cases_true=cases_estimated) %>%
@@ -883,7 +884,8 @@ mcmc_single <- function(
                        serial_max,
                        ndraws=1,
                        maximise=maximise,
-                       is_negative_binomial=is_negative_binomial)
+                       is_negative_binomial=is_negative_binomial,
+                       R_sd=R_sd)
     # nocov start
     if(nrow(df_Rt) != num_Rts)
       stop("Number of Rts outputted not equal to initial Rt dims.")
@@ -1098,7 +1100,8 @@ mcmc <- function(
     nchains=1, is_parallel=FALSE,
     initial_overdispersion=5,
     is_negative_binomial=FALSE,
-    overdispersion_metropolis_sd=0.25) {
+    overdispersion_metropolis_sd=0.25,
+    R_sd=0.25) {
 
   if(nchains==1) {
     res <- mcmc_single(niterations,

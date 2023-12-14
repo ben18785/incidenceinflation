@@ -169,8 +169,7 @@ Rt_df_nb <- sample_Rt(cases_history_df,
   ndraws = 1000,
   serial_max = 20,
   is_negative_binomial = TRUE,
-  kappa=10,
-  nresamples=1000) %>% 
+  kappa=10) %>% 
   mutate(method="negative_binomial")
 Rt_df_po <- sample_Rt(cases_history_df,
   Rt_prior, s_params,
