@@ -164,14 +164,6 @@ cases_history_df <- cases_history_df %>%
 # Prior on each Rt segment value
 Rt_prior <- list(shape=5, rate=5)
 
-Rt_df_nb <- sample_Rt(cases_history_df,
-  Rt_prior, s_params,
-  ndraws = 1000,
-  serial_max = 20,
-  is_negative_binomial = TRUE,
-  kappa=10,
-  nresamples=1000) %>% 
-  mutate(method="negative_binomial")
 Rt_df_po <- sample_Rt(cases_history_df,
   Rt_prior, s_params,
   ndraws = 1000,
